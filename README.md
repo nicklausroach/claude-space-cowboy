@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" alt="claude-space-cowboy logo" width="213"></p>
+
 # claude-space-cowboy
 
 A [Claude Code](https://claude.com/claude-code) skill that coordinates
