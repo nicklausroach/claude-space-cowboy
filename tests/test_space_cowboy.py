@@ -62,6 +62,9 @@ class SpaceCowboyTest(unittest.TestCase):
         self.assertIn("CLAUDE_COWBOY_BACKEND=hc", hc)
         self.assertIn("CLAUDE_COWBOY_HC_SPACE=sp9", hc)
         self.assertNotIn("HERDR_SESSION", hc)
+        # The window reports remote spaces as "<machine>/<id>"; the remote core wants the bare id.
+        hc = load(self.tmp.name, HC_TERMINAL_ID="t4").cowboy_argv(m, ["spawn"], space="devbox/sp9")[-1]
+        self.assertIn("CLAUDE_COWBOY_HC_SPACE=sp9 ", hc)
         herdr = load(self.tmp.name).cowboy_argv(m, ["status"])[-1]
         self.assertIn("CLAUDE_COWBOY_HERDR_SESSION=s1", herdr)
         self.assertNotIn("BACKEND", herdr)

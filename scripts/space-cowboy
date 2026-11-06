@@ -152,7 +152,10 @@ def cowboy_argv(machine, args, space=None):
     if BACKEND == "hc":
         env = "CLAUDE_COWBOY_COORDINATED=1 CLAUDE_COWBOY_BACKEND=hc"
         if space:
-            env += f" CLAUDE_COWBOY_HC_SPACE={shlex.quote(space)}"
+            # This window names a remote space "<machine>/<id>"; the label the remote core
+            # stores is read relative to that machine, so it gets the bare id.
+            prefix = f"{machine['label']}/"
+            env += f" CLAUDE_COWBOY_HC_SPACE={shlex.quote(space[len(prefix):] if space.startswith(prefix) else space)}"
     else:
         env = f"CLAUDE_COWBOY_COORDINATED=1 CLAUDE_COWBOY_HERDR_SESSION={shlex.quote(machine['session'])}"
     return remote_shell(machine, f"{env} {COWBOY} {' '.join(shlex.quote(a) for a in args)}")
