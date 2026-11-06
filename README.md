@@ -20,7 +20,7 @@ See [`SKILL.md`](SKILL.md) for full usage.
 - **Every machine, this one included:** [claude-cowboy](https://github.com/nicklausroach/claude-cowboy)
   with coordinator support, Python 3.11+ (or `tomli`), Git, Claude Code (signed in) and a
   running Herdr server.
-- **Each remote** is saved in Herdr: `herdr machine add --label <label> <ssh-target>`.
+- **Each remote** is saved in Herdr: `herdr machine add --label <label> <ssh-target>` in the terminal app, or `hc machine add <ssh-target>` in the desktop app (where remote agents then show up as tabs of a `🐄 <repo> @ <machine>` space).
 
 `space-cowboy doctor` checks all of this.
 
@@ -67,7 +67,7 @@ Host devbox gpu-box
 
 ## Usage
 
-Start Claude Code inside a Herdr pane on your laptop and hand it a job:
+Start Claude Code inside Herdr (terminal or desktop app) on your laptop and hand it a job:
 
 ```
 /claude-space-cowboy add input validation to the API on devbox, and the matching training-data checks in the ML repo on gpu-box
@@ -106,3 +106,11 @@ set per machine: `space-cowboy on devbox config --set agent.model=sonnet`.
   `space-cowboy on <machine> config --set agent.permission_mode=acceptEdits` on remotes that
   can reach sensitive systems.
 - Agent reports and diffs come back into the coordinating session.
+
+## Tests
+
+The tests use only the standard library and mock Herdr, SSH and the desktop app. Run them from the repo root:
+
+```bash
+python3 -m unittest discover tests -v
+```

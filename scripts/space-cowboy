@@ -3,9 +3,15 @@
 session. Every agent operation is a claude-cowboy command run on the machine that holds
 the repo (directly for `local`, over SSH for saved Herdr machines).
 
-Machines come from `herdr machine list --json`; `local` is always available.
+Two Herdr apps are supported. In the terminal app (HERDR_ENV=1) machines come from
+`herdr machine list --json`. In the desktop app (HC_TERMINAL_ID set) they come from
+`hc machine ls --json`, each remote agent is run by that machine's herdr-core, and its tab
+opens in a "🐄 <repo> @ <machine>" space of this window. `local` is always available.
+CLAUDE_COWBOY_BACKEND=herdr|hc forces one.
+
 Optional settings live in $CLAUDE_SPACE_COWBOY_HOME (default ~/.claude/claude-space-cowboy):
-  config.json   {"machines": {"<label>": {"repos": ["~/path", ...]}}}
+  config.json      {"machines": {"<label>": {"repos": ["~/path", ...]}}}
+  hc-spaces.json   desktop-app space id per "<machine>:<repo>" (written by this helper)
 """
 
 import argparse
@@ -27,24 +33,53 @@ SSH_OPTS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
 SSH_FAILED = 255
 WAIT_RETRIES = 5
 
+
+def _backend():
+    """Same rule as claude-cowboy: an inner terminal Herdr wins over the desktop app."""
+    forced = os.environ.get("CLAUDE_COWBOY_BACKEND")
+    if forced in ("herdr", "hc"):
+        return forced
+    if os.environ.get("HERDR_ENV") == "1":
+        return "herdr"
+    return "hc" if os.environ.get("HC_TERMINAL_ID") else "herdr"
+
+
+BACKEND = _backend()
+
+
+def _bin(name):
+    exe = shutil.which(name)
+    if not exe and (Path.home() / ".local" / "bin" / name).exists():
+        exe = str(Path.home() / ".local" / "bin" / name)
+    return exe or name
+
 # Run on each machine by `doctor`. One "ok|warn|fail <check> <detail>" line per check.
 DOCTOR_SCRIPT = r"""
 cb="$HOME/.claude/skills/claude-cowboy/scripts/cowboy"
 say() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+need=CLAUDE_COWBOY_COORDINATED; [ "$BACKEND" = hc ] && need=CLAUDE_COWBOY_HC_SPACE
 if [ -x "$cb" ]; then
-  if grep -q CLAUDE_COWBOY_COORDINATED "$cb"; then say ok claude-cowboy "$cb"
-  else say fail claude-cowboy "installed but too old for coordination; git pull it"; fi
+  if grep -q "$need" "$cb"; then say ok claude-cowboy "$cb"
+  else say fail claude-cowboy "installed but too old for $([ "$BACKEND" = hc ] && echo 'the Herdr desktop app' || echo coordination); git pull it"; fi
 else say fail claude-cowboy "not installed at $cb"; fi
 if command -v python3 >/dev/null 2>&1; then
   v=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
   if python3 -c 'import tomllib' 2>/dev/null || python3 -c 'import tomli' 2>/dev/null; then say ok python3 "$v"
   else say fail python3 "$v has no tomllib; needs 3.11+ or the tomli package"; fi
 else say fail python3 "not on PATH"; fi
+if [ "$BACKEND" = hc ]; then
+h=$(command -v hc 2>/dev/null || { [ -x "$HOME/.local/bin/hc" ] && echo "$HOME/.local/bin/hc"; })
+if [ -n "$h" ]; then
+  if "$h" server status --json >/dev/null 2>&1; then say ok herdr-core "$h (core running)"
+  else say fail herdr-core "$h (no core running; add this machine in the Herdr app)"; fi
+else say fail herdr-core "hc not found (add this machine in the Herdr app: hc machine add)"; fi
+else
 h=$(command -v herdr 2>/dev/null || { [ -x "$HOME/.local/bin/herdr" ] && echo "$HOME/.local/bin/herdr"; })
 if [ -n "$h" ]; then
   if "$h" status server 2>/dev/null | grep -q 'status: running'; then say ok herdr "$h (server running)"
   else say fail herdr "$h (no server running; connect to this machine from Herdr once)"; fi
 else say fail herdr "not found"; fi
+fi
 for t in git claude; do
   if command -v "$t" >/dev/null 2>&1; then say ok "$t" "$(command -v "$t")"; else say fail "$t" "not on PATH"; fi
 done
@@ -72,11 +107,18 @@ def load_config():
 
 
 def saved_machines():
-    herdr = shutil.which("herdr") or "herdr"
-    p = subprocess.run([herdr, "machine", "list", "--json"], capture_output=True, text=True)
+    """[{label, target, session}] from whichever Herdr app this session runs in."""
+    if BACKEND == "hc":
+        p = subprocess.run([_bin("hc"), "machine", "ls", "--json"], capture_output=True, text=True)
+        if p.returncode != 0:
+            raise SpaceError(f"hc machine ls failed: {(p.stderr or p.stdout).strip()[:300]}")
+        return [{"label": m["name"], "target": m["target"], "session": None}
+                for m in json.loads(p.stdout or "{}").get("machines", []) if not m.get("via")]
+    p = subprocess.run([_bin("herdr"), "machine", "list", "--json"], capture_output=True, text=True)
     if p.returncode != 0:
         raise SpaceError(f"herdr machine list failed: {(p.stderr or p.stdout).strip()[:300]}")
-    return [m for m in json.loads(p.stdout or "[]") if m.get("enabled")]
+    return [{"label": m["label"], "target": m["target"], "session": m.get("session") or "default"}
+            for m in json.loads(p.stdout or "[]") if m.get("enabled")]
 
 
 def machines():
@@ -84,7 +126,7 @@ def machines():
     cfg = load_config().get("machines", {})
     out = {LOCAL: {"label": LOCAL, "target": None, "session": None}}
     for m in saved_machines():
-        out[m["label"]] = {"label": m["label"], "target": m["target"], "session": m.get("session") or "default"}
+        out[m["label"]] = m
     for label, m in out.items():
         m["repos"] = cfg.get(label, {}).get("repos", [])
     return out
@@ -93,8 +135,8 @@ def machines():
 def resolve(label, all_machines=None):
     all_machines = all_machines or machines()
     if label not in all_machines:
-        raise SpaceError(f"unknown machine {label!r} (have: {', '.join(all_machines)}); "
-                         f"add one with `herdr machine add`")
+        raise SpaceError(f"unknown machine {label!r} (have: {', '.join(all_machines)}); add one with "
+                         f"`{'hc machine add' if BACKEND == 'hc' else 'herdr machine add'}`")
     return all_machines[label]
 
 
@@ -104,15 +146,84 @@ def remote_shell(machine, command):
     return ["ssh", *SSH_OPTS, machine["target"], f'exec "$SHELL" -lc {shlex.quote(command)}']
 
 
-def cowboy_argv(machine, args):
+def cowboy_argv(machine, args, space=None):
     if machine["label"] == LOCAL:
         return [os.environ.get("CLAUDE_COWBOY_BIN") or os.path.expanduser(COWBOY), *args]
-    env = f"CLAUDE_COWBOY_COORDINATED=1 CLAUDE_COWBOY_HERDR_SESSION={shlex.quote(machine['session'])}"
+    if BACKEND == "hc":
+        env = "CLAUDE_COWBOY_COORDINATED=1 CLAUDE_COWBOY_BACKEND=hc"
+        if space:
+            env += f" CLAUDE_COWBOY_HC_SPACE={shlex.quote(space)}"
+    else:
+        env = f"CLAUDE_COWBOY_COORDINATED=1 CLAUDE_COWBOY_HERDR_SESSION={shlex.quote(machine['session'])}"
     return remote_shell(machine, f"{env} {COWBOY} {' '.join(shlex.quote(a) for a in args)}")
 
 
-def run_cowboy(machine, args, stdin=None, capture=False):
-    argv = cowboy_argv(machine, args)
+# ---------------------------------------------------------------- desktop-app window
+
+def app_run(args):
+    p = subprocess.run([_bin("herdr-app"), *args], capture_output=True, text=True)
+    try:
+        out = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None
+    return None if p.returncode != 0 or (isinstance(out, dict) and "error" in out) else out
+
+
+def flag_value(args, *flags):
+    for f in flags:
+        if f in args and args.index(f) + 1 < len(args):
+            return args[args.index(f) + 1]
+    return None
+
+
+def remote_space(machine, repo):
+    """Space id in this window for agents of `repo` on a remote machine, created on first
+    use. The remote helper labels its agents' terminals with it, so they show up here.
+    None (agents run without a tab) when the window can't be reached."""
+    layout = app_run(["ls"])
+    if layout is None:
+        return None
+    key = f"{machine['label']}:{repo or '~'}"
+    cache_file = HOME / "hc-spaces.json"
+    try:
+        cache = json.loads(cache_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+    if cache.get(key) in {s["id"] for s in layout.get("spaces", [])}:
+        return cache[key]
+    kw = {"name": f"🐄 {os.path.basename((repo or '~').rstrip('/')) or '~'} @ {machine['label']}",
+          "machine": machine["label"], "tab": "shell"}
+    if repo and repo.startswith("/"):
+        kw["folder"] = repo  # `~/x` isn't expanded by the app; without a folder it opens in home
+    made = app_run(["do", "space.new", json.dumps(kw)])
+    if not made or not made.get("space"):
+        return None
+    cache[key] = made["space"]
+    HOME.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(cache, indent=2) + "\n")
+    return made["space"]
+
+
+def name_tabs(agents):
+    """Rename tabs that still have a number for a name and hold a cowboy agent
+    (terminal name cow-<id>) to "🐄 <task> (<id>)". The remote helper can't do it: the
+    window is on this machine."""
+    by_name = {f"cow-{a['id']}": a for a in agents if a.get("backend") == "hc"}
+    if not by_name:
+        return
+    for s in (app_run(["ls"]) or {}).get("spaces", []):
+        for t in s.get("tabs", []):
+            if not str(t.get("name", "")).isdigit():
+                continue
+            for x in t.get("terminals", []):
+                a = by_name.get(x.get("name"))
+                if a:
+                    app_run(["do", "tab.rename", json.dumps({"id": t["id"], "name": f"🐄 {a['task_name']} ({a['id']})"})])
+                    break
+
+
+def run_cowboy(machine, args, stdin=None, capture=False, space=None):
+    argv = cowboy_argv(machine, args, space)
     try:
         return subprocess.run(argv, input=stdin, text=True, capture_output=capture,
                               stdin=None if stdin is not None else subprocess.DEVNULL)
@@ -151,7 +262,8 @@ def doctor_one(machine):
         argv = ["sh", "-s"]
     else:
         argv = remote_shell(machine, "sh -s")
-    p = subprocess.run(argv, input=DOCTOR_SCRIPT, capture_output=True, text=True, timeout=60)
+    script = f"BACKEND={BACKEND}\n{DOCTOR_SCRIPT}"
+    p = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=60)
     if p.returncode == SSH_FAILED and machine["label"] != LOCAL:
         return [("fail", "ssh", (p.stderr.strip() or "connection failed")[:200])]
     rows = [tuple(line.split("\t", 2)) for line in p.stdout.splitlines() if line.count("\t") == 2]
@@ -196,6 +308,8 @@ def cmd_status(args):
                           for label, agents, err in results}, indent=2))
         return
     rows = [(label, a) for label, agents, err in results if err is None for a in agents]
+    if BACKEND == "hc":
+        name_tabs([a for label, a in rows if label != LOCAL])  # e.g. queued agents started since
     for label, _, err in results:
         if err:
             print(f"✗ {label}: {err}")
@@ -218,15 +332,22 @@ def cmd_on(args):
         raise SpaceError("give a claude-cowboy command, e.g. `on devbox status`")
     rest, stdin = inline_prompt_file(rest)
     print(f"── {machine['label']} ──", flush=True)
+    remote_hc = BACKEND == "hc" and machine["label"] != LOCAL
+    space = remote_space(machine, flag_value(rest, "--repo")) if remote_hc and rest[0] == "spawn" else None
     attempts = WAIT_RETRIES if rest[0] == "wait" and machine["label"] != LOCAL else 1
     for n in range(attempts):
-        p = run_cowboy(machine, rest, stdin=stdin)
+        p = run_cowboy(machine, rest, stdin=stdin, space=space)
         # Waiting is safe to repeat: agent state lives on the machine, not in this process.
         if p.returncode != SSH_FAILED or n == attempts - 1:
             break
         delay = min(60, 5 * 2 ** n)
         print(f"! SSH to {machine['label']} dropped; waiting again in {delay}s", file=sys.stderr, flush=True)
         time.sleep(delay)
+    if remote_hc and rest[0] in ("spawn", "wait", "cleanup") and p.returncode == 0:
+        # A spawn (or a slot freed by wait/cleanup) may have started agents: name their tabs.
+        _, agents, err = status_one(machine, False)
+        if err is None:
+            name_tabs(agents)
     sys.exit(p.returncode)
 
 

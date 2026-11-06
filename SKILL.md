@@ -1,6 +1,6 @@
 ---
 name: claude-space-cowboy
-description: "Multi-machine coordinator for claude-cowboy: from one Claude Code session, spawn, steer, review and land background coding agents on several machines (this one plus SSH machines saved in Herdr), with each agent running in a Herdr workspace and Git worktree on the machine that holds its repo. Use when the user invokes /claude-space-cowboy, names a remote machine for cowboy agents (e.g. \"on devbox\"), or asks to run agents across machines. For agents in the current repo on this machine only, use claude-cowboy instead. Requires claude-cowboy on every machine and Herdr here."
+description: "Multi-machine coordinator for claude-cowboy: from one Claude Code session, spawn, steer, review and land background coding agents on several machines (this one plus SSH machines saved in Herdr, terminal or desktop app), with each agent running in a Herdr workspace and Git worktree on the machine that holds its repo. Use when the user invokes /claude-space-cowboy, names a remote machine for cowboy agents (e.g. \"on devbox\"), or asks to run agents across machines. For agents in the current repo on this machine only, use claude-cowboy instead. Requires claude-cowboy on every machine and Herdr here."
 ---
 
 # claude-space-cowboy
@@ -25,13 +25,17 @@ Check these first. If one fails, tell the user and stop.
 ~/.claude/skills/claude-space-cowboy/scripts/space-cowboy doctor
 ```
 
-- `machines` lists `local` plus every enabled Herdr SSH machine (`herdr machine add` adds
-  more) and any repos configured for each.
+- `machines` lists `local` plus every Herdr SSH machine (terminal app: `herdr machine add`;
+  desktop app: `hc machine add`) and any repos configured for each.
 - `doctor` checks each machine for claude-cowboy (a version with coordinator support),
-  Python 3.11+, a running Herdr server, `git`, `claude` and copy-on-write cloning. A `✗`
+  Python 3.11+, a running Herdr server (desktop app: herdr-core), `git`, `claude` and copy-on-write cloning. A `✗`
   on a machine means agents can't run there yet. Copy-on-write is only a warning:
   worktrees then start without ignored files like `node_modules`.
-- Spawning on `local` also needs this session to be inside a Herdr pane (`HERDR_ENV=1`).
+- Spawning on `local` also needs this session to be inside Herdr (`HERDR_ENV=1`, or
+  `HC_TERMINAL_ID` in the desktop app).
+- In the desktop app, a remote agent opens as a `🐄 <task> (<id>)` tab in a
+  `🐄 <repo> @ <machine>` space of this window, created on the first spawn for that repo.
+  Pass `--repo` as an absolute path so the space's shell tab opens there too.
 
 ## If invoked with arguments
 
