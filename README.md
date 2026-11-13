@@ -2,39 +2,42 @@
 
 # claude-space-cowboy
 
-A [Claude Code](https://claude.com/claude-code) skill that coordinates
-[claude-cowboy](https://github.com/nicklausroach/claude-cowboy) agents on several machines
-from one session.
+A [Claude Code](https://claude.com/claude-code) skill that runs coding jobs in fresh
+[Ona](https://ona.com) environments, driven from one Claude Code session on your laptop.
 
-claude-cowboy runs background coding agents in Herdr workspaces, each in its own Git
-worktree, on the machine you're on. claude-space-cowboy lets the session on your laptop
-spawn, steer, review and land those agents on remote machines too. Each agent runs on the
-machine that holds its repo. The coordinator sends claude-cowboy commands there over SSH,
-and the agents' Herdr workspaces appear under that machine in your Herdr sidebar.
+For each job, the coordinator:
 
-See [`SKILL.md`](SKILL.md) for full usage.
+1. creates an Ona environment from the repo's project (`cowboy-<job>`)
+2. prepares it (Claude Code, [claude-cowboy](https://github.com/nicklausroach/claude-cowboy),
+   Herdr core, gh + gh-stack, your work git email) and adds it to Herdr as a
+   machine
+3. runs one or more claude-cowboy agents there, each a Claude Code session in its own Git
+   worktree, visible as tabs in Herdr (terminal or desktop app)
+4. reviews and steers them, then (when you say so) lands their work as one PR or a
+   [`gh stack`](https://github.com/github/gh-stack) of PRs, stops the environment, and
+   later deletes it.
+
+It also still drives agents on saved Herdr SSH machines (`space-cowboy on <machine> …`).
+
+See [`SKILL.md`](SKILL.md) for the full workflow.
 
 ## Requirements
 
-- **This machine:** Claude Code, Herdr, Python 3, SSH access to each remote.
-- **Every machine, this one included:** [claude-cowboy](https://github.com/nicklausroach/claude-cowboy)
-  with coordinator support, Python 3.11+ (or `tomli`), Git, Claude Code (signed in) and a
-  running Herdr server.
-- **Each remote** is saved in Herdr: `herdr machine add --label <label> <ssh-target>` in the terminal app, or `hc machine add <ssh-target>` in the desktop app (where remote agents then show up as tabs of a `🐄 <repo> @ <machine>` space).
+- **This machine:** Claude Code, Herdr (terminal app or desktop app), Python 3.11+, the
+  [`ona` CLI](https://ona.com/docs) signed in (`ona login`) with its SSH integration
+  (`ona environment ssh-config`), and
+  [claude-cowboy](https://github.com/nicklausroach/claude-cowboy).
+- **Ona:** a project for each repo, GitHub connected on the runner region you use
+  (default Ohio), and a `CLAUDE_CODE_OAUTH_TOKEN`-providing user secret so Claude Code can
+  sign in inside environments (e.g. a `DEV_CLAUDE_CODE_OAUTH_TOKEN` secret mounted as an
+  env var; create one with `claude setup-token`).
 
-`space-cowboy doctor` checks all of this.
+Environments need nothing preinstalled: `env create` sets them up and writes no credentials.
 
 ## Install
 
-On the coordinating machine:
-
 ```bash
 git clone https://github.com/nicklausroach/claude-space-cowboy ~/.claude/skills/claude-space-cowboy
-```
-
-On every machine, including the coordinator:
-
-```bash
 git clone https://github.com/nicklausroach/claude-cowboy ~/.claude/skills/claude-cowboy
 ```
 
@@ -48,69 +51,49 @@ locations. Allow-rules for `~/.claude/settings.json`:
 ] } }
 ```
 
-Then add the claude-cowboy rule to each remote's `~/.claude/settings.json`, and open
-Claude Code once in each repo you'll use there, so its folder-trust setting carries over
-to agent worktrees.
-
-### Recommended SSH settings
-
-Several background waiters share each connection, and long waits should survive idle
-periods. In `~/.ssh/config`:
-
-```
-Host devbox gpu-box
-  ControlMaster auto
-  ControlPath ~/.ssh/cm-%C
-  ControlPersist 10m
-  ServerAliveInterval 30
-```
-
 ## Usage
 
-Start Claude Code inside Herdr (terminal or desktop app) on your laptop and hand it a job:
+Start Claude Code inside Herdr and hand it a job:
 
 ```
-/claude-space-cowboy add input validation to the API on devbox, and the matching training-data checks in the ML repo on gpu-box
+/claude-space-cowboy in dbt: add not-null tests to the finance marts, one PR per mart as a stack
 ```
 
 The helper on its own:
 
 | Command | What it does |
 | --- | --- |
-| `space-cowboy machines` | List `local` plus saved Herdr machines and their configured repos |
-| `space-cowboy doctor [machine…]` | Check each machine can run agents |
-| `space-cowboy status [machine…]` | List agents on every machine, as `machine:id` |
-| `space-cowboy on <machine> <cowboy command…>` | Run any claude-cowboy command on that machine |
-
-`on <machine> spawn -f FILE` reads the prompt file on this machine and sends it over.
-`on <machine> wait` reconnects if SSH drops, since waiting can safely be repeated.
+| `space-cowboy env projects` | List Ona projects and where each repo lands in an environment |
+| `space-cowboy env create <project> --name <job>` | Create, prepare and add a `cowboy-<job>` environment to Herdr |
+| `space-cowboy env list` | Environments made here and their Ona phase |
+| `space-cowboy env setup <machine>` | Repeat preparation and re-add to Herdr (safe to repeat) |
+| `space-cowboy env stop` / `start <machine>` | Stop (keeps the disk) or resume an environment |
+| `space-cowboy env delete <machine>` | Delete the environment and its Herdr machine |
+| `space-cowboy on <machine> <cowboy command…>` | Run any claude-cowboy command there (`spawn`, `wait`, `diff`, `steer`, …) |
+| `space-cowboy status [machine…]` | Agents on every machine, as `machine:id` |
+| `space-cowboy machines` / `doctor [machine…]` | List machines; check agents can run there |
 
 ## Configuration
 
-`~/.claude/claude-space-cowboy/config.json` (optional) records which repos live where, so
-the coordinator can route tasks without asking:
+`~/.claude/claude-space-cowboy/config.json` (optional):
 
 ```json
-{ "machines": { "devbox": { "repos": ["~/api"] } } }
+{
+  "ona": { "region": "Ohio", "inactivity_timeout": "4h", "projects": { "ac": "Analytics Cluster" } },
+  "machines": { "devbox": { "repos": ["~/api"] } }
+}
 ```
 
-Everything else (concurrency, models, templates, permission mode) is claude-cowboy config,
-set per machine: `space-cowboy on devbox config --set agent.model=sonnet`.
+Agent settings (concurrency, models, templates, permission mode) are claude-cowboy
+config, per machine: `space-cowboy on <machine> config --set agent.model=sonnet`.
 
 ## Notes
 
-- Remote commands run in the remote user's login shell, so `PATH` matches an interactive
-  session. Commands get `CLAUDE_COWBOY_COORDINATED=1` and the machine's Herdr session from
-  `herdr machine list`.
-- claude-cowboy runs agents with permission checks **bypassed by default**. Consider
-  `space-cowboy on <machine> config --set agent.permission_mode=acceptEdits` on remotes that
-  can reach sensitive systems.
+- Ona sends an environment to a project's first environment class unless told otherwise,
+  and that class's runner may not have your GitHub sign-in. `env create` picks the
+  project's class in the configured region instead.
+- claude-cowboy runs agents with permission checks **bypassed by default**. Each
+  environment is a fresh, single-purpose sandbox, but it can push to your repos.
+- `gh` in an environment is a wrapper that borrows git's Ona-provided GitHub credential on
+  each call; nothing is stored. Claude Code signs in from `CLAUDE_CODE_OAUTH_TOKEN`.
 - Agent reports and diffs come back into the coordinating session.
-
-## Tests
-
-The tests use only the standard library and mock Herdr, SSH and the desktop app. Run them from the repo root:
-
-```bash
-python3 -m unittest discover tests -v
-```

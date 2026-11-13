@@ -18,6 +18,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -127,8 +128,11 @@ def machines():
     out = {LOCAL: {"label": LOCAL, "target": None, "session": None}}
     for m in saved_machines():
         out[m["label"]] = m
+    envs = load_envs()
     for label, m in out.items():
-        m["repos"] = cfg.get(label, {}).get("repos", [])
+        m["repos"] = cfg.get(label, {}).get("repos") or envs.get(label, {}).get("repos", [])
+        if label in envs:
+            m["ona_env"] = envs[label]["id"]
     return out
 
 
@@ -248,6 +252,360 @@ def inline_prompt_file(args):
     return args, None
 
 
+# ---------------------------------------------------------------- Ona environments
+#
+# `env create` makes a fresh Ona environment for one job, prepares it (scripts/ona-bootstrap.sh)
+# and adds it to Herdr as a machine, so every `on <machine>` command works on it.
+# Environments made here are recorded in $HOME/envs.json; only those can be stopped or deleted.
+
+BOOTSTRAP = Path(__file__).resolve().with_name("ona-bootstrap.sh")
+ENVS_FILE = "envs.json"
+ENV_PREFIX = "cowboy-"
+ONA_DEFAULTS = {"region": "Ohio", "inactivity_timeout": "4h"}
+RUNNING = "ENVIRONMENT_PHASE_RUNNING"
+UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+
+
+def ona_settings():
+    return {**ONA_DEFAULTS, **load_config().get("ona", {})}
+
+
+def ona(args, as_json=False, timeout=120):
+    argv = [_bin("ona"), *args, *(["-o", "json"] if as_json else [])]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise SpaceError("the ona CLI is not installed (brew install gitpod-io/tap/ona)")
+    out = "\n".join(l for l in p.stdout.splitlines() if not l.startswith("[WARN"))
+    if p.returncode != 0:
+        msg = (p.stderr or p.stdout).strip().splitlines()[-1:] or [f"exit {p.returncode}"]
+        msg = msg[0]
+        if "missing authentication token" in msg:
+            msg += (" (Ona has no GitHub sign-in for you on that runner: pick a region you've "
+                    "signed in on with --region, or open app.gitpod.io and create an environment "
+                    "there once to connect GitHub)")
+        raise SpaceError(f"ona {' '.join(args[:2])}: {msg}")
+    return json.loads(out or "null") if as_json else out
+
+
+def load_envs():
+    try:
+        return json.loads((HOME / ENVS_FILE).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_envs(envs):
+    HOME.mkdir(parents=True, exist_ok=True)
+    tmp = HOME / (ENVS_FILE + ".tmp")
+    tmp.write_text(json.dumps(envs, indent=2) + "\n")
+    tmp.replace(HOME / ENVS_FILE)
+
+
+def get_env(name):
+    envs = load_envs()
+    if name not in envs:
+        made = ", ".join(envs) or "none"
+        raise SpaceError(f"{name!r} is not an environment made by space-cowboy (made here: {made})")
+    return envs[name]
+
+
+def env_target(env_id):
+    """Ona's SSH integration (`ona environment ssh-config`) resolves <id>.gitpod.environment."""
+    return f"{env_id}.gitpod.environment"
+
+
+def repo_key(url):
+    return url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git").casefold()
+
+
+def find_project(query):
+    """An Ona project by id, name, config alias or repo name (`dbt`, `obsidian`)."""
+    alias = ona_settings().get("projects", {}).get(query)
+    query = alias or query
+    projects = ona(["project", "list"], as_json=True) or []
+    q = query.casefold()
+    for test in (lambda p: p["id"] == query,
+                 lambda p: p["metadata"]["name"].casefold() == q,
+                 lambda p: any(repo_key(s.get("git", {}).get("remoteUri", "")) == q
+                               for s in p.get("initializer", {}).get("specs", []))):
+        hits = [p for p in projects if test(p)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            names = ", ".join(f"{p['metadata']['name']} ({p['id']})" for p in hits)
+            raise SpaceError(f"{query!r} matches several Ona projects: {names}; pass the id or name")
+    names = ", ".join(p["metadata"]["name"] for p in projects)
+    raise SpaceError(f"no Ona project matches {query!r} (have: {names})")
+
+
+def project_repos(project):
+    """Where the project's repos are checked out inside the environment."""
+    return [f"/workspaces/{s['git']['checkoutLocation']}"
+            for s in project.get("initializer", {}).get("specs", []) if s.get("git", {}).get("checkoutLocation")]
+
+
+def pick_class(project, region):
+    """The project's preferred environment class on the runner in `region`. Ona otherwise
+    uses the project's first class, whose runner may lack the user's GitHub sign-in."""
+    runner_of = {c["id"]: c.get("runner", "") for c in ona(["environment", "list-classes"], as_json=True) or []
+                 if c.get("enabled", True)}
+    ordered = sorted(project.get("environmentClasses", []), key=lambda c: c.get("order", 0))
+    ids = [c["environmentClassId"] for c in ordered if c.get("environmentClassId")]
+    for cid in ids:
+        if runner_of.get(cid, "").casefold() == region.casefold():
+            return cid
+    regions = sorted({runner_of[c] for c in ids if c in runner_of})
+    raise SpaceError(f"project {project['metadata']['name']} has no environment class in {region!r} "
+                     f"(it has: {', '.join(regions) or 'none'}); pass --region or --class-id")
+
+
+def env_phase(env_id):
+    d = ona(["environment", "get", env_id], as_json=True)
+    d = d[0] if isinstance(d, list) else d
+    return (d or {}).get("status", {}).get("phase", "unknown")
+
+
+def wait_running(env_id, timeout=900, stopped_grace=120):
+    """Wait for RUNNING. Just after a start the phase can still read stopped/stopping, so
+    those count as failure only once it has moved on, or after `stopped_grace` seconds."""
+    start, last, moved = time.time(), None, False
+    while time.time() < start + timeout:
+        phase = env_phase(env_id)
+        if phase != last:
+            print(f"  … {phase.removeprefix('ENVIRONMENT_PHASE_').lower()}", flush=True)
+            last = phase
+        if phase == RUNNING:
+            return
+        stopped = phase.endswith(("STOPPED", "STOPPING"))
+        moved |= not stopped
+        if phase.endswith(("FAILED", "DELETING", "DELETED")) or (
+                stopped and (moved or time.time() - start > stopped_grace)):
+            raise SpaceError(f"environment {env_id} went to {phase}; see `ona environment logs {env_id}`")
+        time.sleep(10)
+    raise SpaceError(f"environment {env_id} not running after {timeout // 60} minutes")
+
+
+def wait_ssh(machine, attempts=12):
+    for _ in range(attempts):
+        p = subprocess.run(remote_shell(machine, "true"), capture_output=True, text=True, timeout=120)
+        if p.returncode == 0:
+            return
+        time.sleep(10)
+    raise SpaceError(f"can't SSH to {machine['target']}: {p.stderr.strip()[:200]}")
+
+
+def git_identity():
+    s = ona_settings()
+    get = lambda k: subprocess.run(["git", "config", "--global", k], capture_output=True, text=True).stdout.strip()
+    return s.get("git_email") or get("user.email"), s.get("git_name") or get("user.name")
+
+
+def bootstrap(machine, repos):
+    """Run ona-bootstrap.sh there; returns its (level, step, detail) rows."""
+    email, name = git_identity()
+    env = " ".join(f"{k}={shlex.quote(v)}" for k, v in
+                   (("COWBOY_REPOS", " ".join(repos)), ("COWBOY_GIT_EMAIL", email), ("COWBOY_GIT_NAME", name)) if v)
+    p = subprocess.run(remote_shell(machine, f"{env} sh -s"), input=BOOTSTRAP.read_text(),
+                       capture_output=True, text=True, timeout=900)
+    rows = [tuple(l.split("\t", 2)) for l in p.stdout.splitlines() if l.count("\t") == 2]
+    return rows or [("fail", "bootstrap", (p.stderr or p.stdout).strip()[:300] or f"exit {p.returncode}")]
+
+
+def register(name, target):
+    """Add the environment to this Herdr app as a machine. Not `hc machine add --temp`: the
+    desktop app leaves temporary machines out of its sidebar and can't open spaces on them."""
+    if BACKEND == "hc":
+        p = subprocess.run([_bin("hc"), "machine", "add", "--install", "--json", "--name", name, target],
+                           capture_output=True, text=True, timeout=300)
+    else:
+        p = subprocess.run([_bin("herdr"), "machine", "add", "--label", name, target],
+                           capture_output=True, text=True, timeout=300)
+    if p.returncode != 0:
+        raise SpaceError(f"adding {name} to Herdr failed: {(p.stderr or p.stdout).strip()[:300]}")
+
+
+def unregister(name):
+    if BACKEND == "hc":
+        subprocess.run([_bin("hc"), "machine", "rm", name], capture_output=True, text=True)
+        return
+    for m in json.loads(subprocess.run([_bin("herdr"), "machine", "list", "--json"],
+                                       capture_output=True, text=True).stdout or "[]"):
+        if m.get("label") == name:
+            subprocess.run([_bin("herdr"), "machine", "remove", m["id"]], capture_output=True, text=True)
+
+
+def print_rows(rows):
+    bad = False
+    for level, check, detail in rows:
+        bad |= level == "fail"
+        print(f"  {({'ok': '✓', 'warn': '!', 'fail': '✗'}).get(level, '?')} {check:14} {detail}")
+    return bad
+
+
+def setup_env(name, env):
+    """Bootstrap and (re)register; safe to repeat, e.g. after the environment restarts."""
+    machine = {"label": name, "target": env["target"], "session": "default"}
+    print("  … waiting for SSH", flush=True)
+    wait_ssh(machine)
+    print("  … preparing the environment", flush=True)
+    if print_rows(bootstrap(machine, env["repos"])):
+        raise SpaceError(f"{name} isn't ready for agents (see ✗ above); fix it, then `env setup {name}`")
+    if name not in {m["label"] for m in saved_machines()}:
+        print("  … adding it to Herdr", flush=True)
+        register(name, env["target"])
+    wait_connected(name)
+
+
+def wait_connected(name, timeout=90):
+    """The desktop app connects to a new machine after `hc machine add` returns; a spawn
+    sent before that fails. The terminal app has no such state to wait for."""
+    if BACKEND != "hc":
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        p = subprocess.run([_bin("hc"), "machine", "ls", "--json"], capture_output=True, text=True)
+        try:
+            states = {m["name"]: m.get("state") for m in json.loads(p.stdout or "{}").get("machines", [])}
+        except json.JSONDecodeError:
+            states = {}
+        if states.get(name) == "connected":
+            return
+        time.sleep(3)
+    raise SpaceError(f"Herdr hasn't connected to {name} after {timeout}s; check it in the Herdr sidebar, "
+                     f"then `env setup {name}`")
+
+
+def slug(text):
+    s = re.sub(r"[^a-z0-9]+", "-", text.casefold()).strip("-")
+    return s[:40].strip("-") or "task"
+
+
+def cmd_env_projects(args):
+    projects = ona(["project", "list"], as_json=True) or []
+    if args.json:
+        print(json.dumps([{"id": p["id"], "name": p["metadata"]["name"], "repos": project_repos(p)} for p in projects], indent=2))
+        return
+    print(f"{'PROJECT':40} {'ID':38} REPOS IN ENV")
+    for p in projects:
+        print(f"{p['metadata']['name'][:40]:40} {p['id']:38} {', '.join(project_repos(p)) or '-'}")
+
+
+def cmd_env_create(args):
+    s = ona_settings()
+    project = find_project(args.project)
+    name = ENV_PREFIX + slug(args.name or project["metadata"]["name"]).removeprefix(ENV_PREFIX)
+    taken = set(load_envs()) | {m["label"] for m in saved_machines()}
+    if name in taken:
+        raise SpaceError(f"{name!r} already exists; pick another --name")
+    region = args.region or s["region"]
+    class_id = args.class_id or pick_class(project, region)
+    timeout = args.inactivity_timeout or s["inactivity_timeout"]
+    print(f"Creating Ona environment {name} ({project['metadata']['name']}, {region})", flush=True)
+    out = ona(["environment", "create", project["id"], "--name", name, "--class-id", class_id,
+               "--inactivity-timeout", timeout, "--dont-wait"], timeout=600)
+    ids = UUID.findall(out)
+    if not ids:
+        raise SpaceError(f"ona environment create printed no environment id: {out[-300:]}")
+    env = {"id": ids[-1], "target": env_target(ids[-1]), "project": project["metadata"]["name"],
+           "project_id": project["id"], "repos": project_repos(project), "class_id": class_id,
+           "created_at": time.time()}
+    envs = load_envs()
+    envs[name] = env
+    save_envs(envs)  # recorded before it is ready, so `env delete` can always find it
+    wait_running(env["id"])
+    setup_env(name, env)
+    if args.json:
+        print(json.dumps({"machine": name, **env}, indent=2))
+        return
+    print(f"✓ {name} is ready: machine `{name}`, repo {', '.join(env['repos']) or '(none)'}, env {env['id']}")
+
+
+def cmd_env_setup(args):
+    env = get_env(args.name)
+    if env_phase(env["id"]) != RUNNING:
+        raise SpaceError(f"{args.name} isn't running; `env start {args.name}` first")
+    setup_env(args.name, env)
+    print(f"✓ {args.name} is ready")
+
+
+def cmd_env_start(args):
+    env = get_env(args.name)
+    ona(["environment", "start", env["id"], "--dont-wait"], timeout=600)
+    wait_running(env["id"])
+    setup_env(args.name, env)
+    print(f"✓ {args.name} is running")
+
+
+def cmd_env_stop(args):
+    env = get_env(args.name)
+    ona(["environment", "stop", env["id"]], timeout=600)
+    print(f"✓ stopped {args.name} (its disk, worktrees and agent state are kept; `env start {args.name}` resumes)")
+
+
+def cmd_env_list(args):
+    envs = load_envs()
+    rows, gone = [], []
+    for name, env in envs.items():
+        try:
+            phase = env_phase(env["id"]).removeprefix("ENVIRONMENT_PHASE_").lower()
+        except SpaceError as e:
+            if "not_found" in str(e):  # deleted outside space-cowboy: forget it
+                gone.append(name)
+                continue
+            phase = f"? ({e})"[:40]
+        rows.append({"machine": name, "phase": phase, **env})
+    if gone:
+        save_envs({k: v for k, v in envs.items() if k not in gone})
+        for name in gone:
+            close_spaces(name)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No environments made by space-cowboy.")
+        return
+    print(f"{'MACHINE':32} {'PHASE':10} {'PROJECT':20} {'AGE':>6}  ENV ID")
+    for r in rows:
+        age = int((time.time() - r["created_at"]) / 3600)
+        print(f"{r['machine']:32} {r['phase']:10} {r['project'][:20]:20} {age:>5}h  {r['id']}")
+
+
+def close_spaces(machine):
+    """Close this window's spaces for a deleted machine and forget them."""
+    cache_file = HOME / "hc-spaces.json"
+    try:
+        cache = json.loads(cache_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+    if BACKEND == "hc":
+        for s in (app_run(["ls"]) or {}).get("spaces", []):
+            if s.get("machine") == machine:
+                app_run(["do", "space.close", json.dumps({"id": s["id"], "confirmed": True})])
+    if any(k.startswith(f"{machine}:") for k in cache):
+        cache_file.write_text(json.dumps({k: v for k, v in cache.items()
+                                          if not k.startswith(f"{machine}:")}, indent=2) + "\n")
+
+
+def cmd_env_delete(args):
+    env = get_env(args.name)
+    if not args.force and env_phase(env["id"]) == RUNNING:
+        _, agents, err = status_one({"label": args.name, "target": env["target"], "session": "default"}, False)
+        live = [a["id"] for a in agents or [] if a["status"] in ("running", "queued", "blocked")]
+        if live:
+            raise SpaceError(f"{args.name} still has agents {', '.join(live)}; stop them first or pass --force")
+    unregister(args.name)
+    # Ona accepts the delete at once and the runner finishes it in the background (minutes).
+    # The CLI's own wait for that is slow and can fail even when the delete went through.
+    ona(["environment", "delete", env["id"], "--dont-wait"], timeout=120)
+    envs = load_envs()
+    envs.pop(args.name, None)
+    save_envs(envs)
+    close_spaces(args.name)
+    print(f"✓ deleting {args.name}: removed from Herdr; Ona finishes deleting environment {env['id']} "
+          f"in the background")
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_machines(args):
@@ -337,6 +695,10 @@ def cmd_on(args):
     print(f"── {machine['label']} ──", flush=True)
     remote_hc = BACKEND == "hc" and machine["label"] != LOCAL
     space = remote_space(machine, flag_value(rest, "--repo")) if remote_hc and rest[0] == "spawn" else None
+    if remote_hc and rest[0] == "spawn" and space is None:
+        print(f"! couldn't open a Herdr space for {machine['label']}, so the agent gets no tab "
+              f"(is {machine['label']} in the Herdr sidebar?); it still runs: `hc attach` to watch",
+              file=sys.stderr, flush=True)
     attempts = WAIT_RETRIES if rest[0] == "wait" and machine["label"] != LOCAL else 1
     for n in range(attempts):
         p = run_cowboy(machine, rest, stdin=stdin, space=space)
@@ -371,6 +733,32 @@ def main():
     s.add_argument("--json", action="store_true")
     s.add_argument("--all", action="store_true", help="include cleaned-up agents")
     s.set_defaults(fn=cmd_status)
+
+    env = sub.add_parser("env", help="Ona environments as per-job machines").add_subparsers(dest="env_cmd", required=True)
+    s = env.add_parser("projects", help="list Ona projects and where their repos are checked out")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_env_projects)
+    s = env.add_parser("create", help="create an environment for a job, prepare it and add it to Herdr")
+    s.add_argument("project", help="Ona project id, name, or repo name (e.g. dbt)")
+    s.add_argument("--name", help="short job name; the machine is called cowboy-<name>")
+    s.add_argument("--region", help=f"runner region (default {ONA_DEFAULTS['region']}, or ona.region in config.json)")
+    s.add_argument("--class-id", help="environment class id (overrides --region)")
+    s.add_argument("--inactivity-timeout", help=f"auto-stop after this long disconnected (default {ONA_DEFAULTS['inactivity_timeout']})")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_env_create)
+    s = env.add_parser("list", aliases=["ls"], help="environments made here, with their Ona phase")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_env_list)
+    for verb, fn, text in (("setup", cmd_env_setup, "re-run preparation and re-add to Herdr (safe to repeat)"),
+                           ("start", cmd_env_start, "start a stopped environment and prepare it again"),
+                           ("stop", cmd_env_stop, "stop an environment, keeping its disk")):
+        s = env.add_parser(verb, help=text)
+        s.add_argument("name")
+        s.set_defaults(fn=fn)
+    s = env.add_parser("delete", help="delete an environment made here and remove it from Herdr (discards its work)")
+    s.add_argument("name")
+    s.add_argument("--force", action="store_true", help="even if agents are still running there")
+    s.set_defaults(fn=cmd_env_delete)
 
     s = sub.add_parser("on", help="run a claude-cowboy command on one machine")
     s.add_argument("machine")
