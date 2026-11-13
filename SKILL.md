@@ -1,146 +1,208 @@
 ---
 name: claude-space-cowboy
-description: "Multi-machine coordinator for claude-cowboy: from one Claude Code session, spawn, steer, review and land background coding agents on several machines (this one plus SSH machines saved in Herdr, terminal or desktop app), with each agent running in a Herdr workspace and Git worktree on the machine that holds its repo. Use when the user invokes /claude-space-cowboy, names a remote machine for cowboy agents (e.g. \"on devbox\"), or asks to run agents across machines. For agents in the current repo on this machine only, use claude-cowboy instead. Requires claude-cowboy on every machine and Herdr here."
+description: "Run coding jobs in fresh Ona environments: for each job, create an Ona environment in the right project, prepare it, add it to Herdr (terminal or desktop app) and run one or more claude-cowboy Claude Code agents there, each in its own Git worktree, then combine their work into one PR or a gh stack of PRs. Also drives agents on saved Herdr SSH machines. Use when the user invokes /claude-space-cowboy, asks for an agent or job \"in Ona\" / \"in a new environment\", or names a remote machine for cowboy agents. For agents in the current repo on this machine only, use claude-cowboy instead."
 ---
 
 # claude-space-cowboy
 
-You coordinate **claude-cowboy** agents on several machines. Each agent runs on the
-machine that holds its repo: its worktree, branch, Herdr workspace and state all live
-there. You drive them from here with one helper,
-`~/.claude/skills/claude-space-cowboy/scripts/space-cowboy`. Always call it by that literal
-path so the user's permission allow-rule matches.
+Each job gets its own **Ona environment**. You create it, the helper prepares it
+(Claude Code, claude-cowboy, Herdr core, gh + gh-stack, work git email) and adds it to
+Herdr as a machine named `cowboy-<job>`. Then you run **claude-cowboy** agents in
+it: each agent is a Claude Code session in its own worktree and branch, shown as a Herdr
+tab. You review, steer and land their work from here.
 
-`space-cowboy on <machine> <cowboy command…>` runs a claude-cowboy command on that
-machine, directly for `local` and over SSH for saved Herdr machines. Every claude-cowboy
-command and flag works the same way, so follow the claude-cowboy workflow (delegate, get
-notified, review and steer, land, clean up) and add `on <machine>` in front.
+Everything goes through one helper. Always call it by this literal path so the user's
+permission allow-rule matches:
+`~/.claude/skills/claude-space-cowboy/scripts/space-cowboy` (below: `space-cowboy`).
 
 ## Preconditions
 
-Check these first. If one fails, tell the user and stop.
-
-```bash
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy machines
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy doctor
-```
-
-- `machines` lists `local` plus every Herdr SSH machine (terminal app: `herdr machine add`;
-  desktop app: `hc machine add`) and any repos configured for each.
-- `doctor` checks each machine for claude-cowboy (a version with coordinator support),
-  Python 3.11+, a running Herdr server (desktop app: herdr-core), `git`, `claude` and copy-on-write cloning. A `✗`
-  on a machine means agents can't run there yet. Copy-on-write is only a warning:
-  worktrees then start without ignored files like `node_modules`.
-- Spawning on `local` also needs this session to be inside Herdr (`HERDR_ENV=1`, or
-  `HC_TERMINAL_ID` in the desktop app).
-- In the desktop app, a remote agent opens as a `🐄 <task> (<id>)` tab in a
-  `🐄 <repo> @ <machine>` space of this window, created on the first spawn for that repo.
-  Pass `--repo` as an absolute path so the space's shell tab opens there too.
+- `ona whoami` works (else the user runs `! ona login`).
+- This session runs inside Herdr: the desktop app (`HC_TERMINAL_ID` set) or the terminal
+  app (`HERDR_ENV=1`). Environments show up in whichever one this is.
 
 ## If invoked with arguments
 
 | Invocation | Do |
 | --- | --- |
-| (no args) | `space-cowboy status`, then summarize and offer the next actions |
+| (no args) | `space-cowboy env list` and `space-cowboy status`, summarize, offer next actions |
 | `status` / `st` | `space-cowboy status` |
-| `machines` | `space-cowboy machines` |
-| `doctor [machine…]` | `space-cowboy doctor [machine…]` |
-| `on <machine> <task…>` | Spawn one agent on that machine for the task |
-| anything else | Treat it as a job to break down and delegate across machines |
+| `envs` | `space-cowboy env list` |
+| `on <machine> <task…>` | Spawn one agent on that existing machine (no new environment) |
+| anything else | A job: run the workflow below |
 
 ## Workflow
 
-### 1. Pick the machine and repo
+### 1. Pick the project, then confirm with the user
 
-Each subtask runs where its repo lives. Use the repos listed by `machines`, or what the
-user tells you. If it's unclear which machine or path holds a repo, ask; don't guess.
-Repos the user names can be saved for next time in
-`~/.claude/claude-space-cowboy/config.json`:
+Find the Ona project that holds the repo: `space-cowboy env projects` lists them with the
+path each repo gets inside an environment (`/workspaces/<repo>`). `env create` accepts a
+project id, its name or its repo name (`dbt`, `analytics-cluster`, `obsidian`). If more
+than one project fits, or none, ask.
 
-```json
-{ "machines": { "devbox": { "repos": ["~/api"] } } }
-```
+**Before creating anything, tell the user in plain words and wait for a yes:** "I'll
+create an Ona environment `cowboy-<job>` from project <Project> (region Ohio, auto-stops
+after 4h disconnected), install Claude Code, claude-cowboy, Herdr core and the gh-stack
+extension in it, set your work git email there, add it to Herdr, and stop it once its PRs
+are open." One yes covers that environment, its setup and that stop. A new environment
+needs a new yes.
 
-Paths are on that machine. `~` means the remote user's home.
-
-### 2. Delegate
-
-Same as claude-cowboy spawn, with `on <machine>` and `--repo <path on that machine>`:
+### 2. Create the environment
 
 ```bash
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy on devbox spawn -t "fix validation" --repo ~/api -f /tmp/prompt.md
-# -f FILE reads a prompt file on THIS machine and sends it over; -p "…" and -p - work too.
+space-cowboy env create <project> --name "<2-3 word job name>"
+```
+
+Takes a few minutes (Bash timeout 900000). It prints progress, the setup checklist and
+finally the machine name and repo path. Options: `--region` (runner region, default Ohio),
+`--class-id`, `--inactivity-timeout` (default 4h). Defaults can be set in config.json
+(below).
+
+- **"missing authentication token for github.com"**: Ona has no GitHub sign-in for the
+  user on that region's runner. Use a region they're signed in on (`--region`), or ask them
+  to create one environment in that region at app.gitpod.io to connect GitHub.
+- **A `✗` in the checklist**: the environment exists and is recorded but isn't ready. Tell
+  the user what failed. After a fix, `space-cowboy env setup <machine>` repeats the setup
+  (safe to run again).
+
+### 3. Plan: one agent or a stack
+
+One focused change → one agent. A larger job → split it into layers that each make a
+reviewable PR (under ~500 changed lines) and run one agent per layer **in the same
+environment**: each gets its own worktree and branch off the same clone, so every branch is
+visible to the others.
+
+- Layers that build on each other: spawn layer N+1 with `--base <layer N's branch>` once
+  layer N is done and reviewed.
+- Independent layers can run at once off `main`; restack them in order when landing
+  (`git rebase --onto <previous branch> main <branch>`, in a worktree).
+
+### 4. Delegate
+
+```bash
+space-cowboy on cowboy-<job> spawn -t "add validation" --repo /workspaces/<repo> -f /tmp/prompt.md
+# -f FILE is read on THIS machine and sent over; -p "…" and -p - work too.
 # All claude-cowboy spawn options work: -a -m -e --harness --base --include-dirty
 ```
 
-The agent id that comes back belongs to that machine. Refer to agents as
-`<machine>:<id>` (e.g. `devbox:k3x9q2ab`) when talking to the user, and always send
-an agent's commands to its own machine. Concurrency limits apply per machine.
+Write prompts the way claude-cowboy describes: goal, constraints, what done looks like.
+Agents run with permission checks bypassed by default. Say so the first time you spawn in
+an environment. Agent ids are per machine. Call them `cowboy-<job>:<id>` to the user and
+send every command for an agent to its own machine.
 
-### 3. Get notified
+### 5. Get notified
 
 Right after each spawn, start one waiter per agent **with Bash `run_in_background: true`**:
 
 ```bash
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy on devbox wait <id>
+space-cowboy on cowboy-<job> wait <id>
 ```
 
-As in claude-cowboy, every spawned agent needs a waiter (queued ones too), and you don't
-poll. If SSH drops, the helper reconnects and waits again a few times; agent state lives on
-the machine, so nothing is lost. If a waiter still exits with an SSH error, start it again.
+Don't poll. If SSH drops, the helper reconnects and waits again; agent state lives in the
+environment. If a waiter still exits with an SSH error, start it again.
 
-### 4. Review, steer, then report back
+### 6. Review, steer, then report back
 
 ```bash
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy on devbox diff <id>          # commits + uncommitted changes
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy on devbox diff <id> --stat
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy on devbox steer <id> -m "follow-up instructions"
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy on devbox stop <id>
+space-cowboy on cowboy-<job> diff <id> [--stat]
+space-cowboy on cowboy-<job> steer <id> -m "follow-up instructions"   # then start a new waiter
+space-cowboy on cowboy-<job> stop <id>
 ```
 
-After a steer, start a new background waiter. When the work looks good, report to the
-user (machine, what changed, your review verdict, branch and worktree path), then **stop
-and wait**.
+When the work looks good, report to the user (what changed, your verdict, branches), then
+**stop and wait**.
 
-### 5. Land the work (only when the user says so)
+### 7. Land the work (only when the user says so)
 
-**Never merge, push, open a PR or clean up on your own initiative.** The user decides how
-work lands.
+**Never push, open PRs, merge or clean up on your own.** Pushing is publishing: describe
+what will be pushed and opened, and wait for a yes. Run git and gh in the environment over
+SSH, using the target from `space-cowboy machines`:
 
-- **Pull request.** Push and open the PR on the agent's machine, from its worktree (paths
-  come from `status --json` or the waiter output). Use the machine's SSH target from
-  `machines`:
-  ```bash
-  ssh <target> 'cd <worktree> && git push -u origin <branch> && gh pr create --base <base> --head <branch> --title "…" --body "…"'
-  ```
-  On `local`, run the same commands without `ssh`.
-- **Local merge** into that machine's main checkout:
-  `space-cowboy on <machine> merge <id> [--target main]`
+```bash
+ssh <target> 'cd <worktree> && git push -u origin <branch> && gh pr create --base main --head <branch> --title "…" --body "…"'
+```
 
-### 6. Clean up (only when the user says so)
+**A stack** (several layers): use `gh stack`, not hand-chained PR bases. From the top
+layer's worktree (all branches are local there):
 
-`space-cowboy on <machine> cleanup <id>`. As in claude-cowboy, `--force` and
-`--delete-unmerged` discard work, so use them only after the user explicitly confirms,
-naming what will be lost.
+```bash
+ssh <target> 'cd <top worktree> && gh stack init <b1> <b2> <b3> && gh stack submit --auto --open'
+```
+
+`--auto` titles the bottom PR from its branch name and fills bodies from the PR template;
+fix them with `gh pr edit N --title … --body-file …`. To change a lower layer later: commit
+on it, `gh stack rebase --no-trunk`, `gh stack push`.
+
+After the PRs are open, **stop the environment** to save cost: `space-cowboy env stop
+cowboy-<job>`. Its disk, branches, worktrees and agent reports are kept; agent processes
+end. For review follow-ups, `space-cowboy env start cowboy-<job>` (about 20s; it prepares
+itself again), then spawn a new agent with `--base <PR branch>` and tell it what to fix (a
+stopped agent can't be steered back to life). Its commits land on a new branch on top of
+the PR's. Once the user says to push, fast-forward the PR from the env:
+`git push origin <agent branch>:<PR branch>`. For a lower stack layer, then run
+`gh stack rebase --no-trunk` and `gh stack push`.
+
+### 8. Clean up (only when the user says so)
+
+```bash
+space-cowboy on cowboy-<job> cleanup <id…>     # if the environment is running
+space-cowboy env delete cowboy-<job>           # deletes the Ona environment and its Herdr machine
+```
+
+Deleting discards everything in the environment that wasn't pushed. Before it, check that
+the branches are pushed (or tell the user which aren't) and get an explicit yes naming the
+environment. `env delete` refuses while agents are still running (`--force` overrides; only
+after the user confirms). It only deletes environments that `env create` made.
+
+## Existing machines
+
+Saved Herdr SSH machines (e.g. long-lived `*-primary` environments) still work with
+`space-cowboy on <machine> …`, with the same steps 4 to 6 and no `env` commands.
+`space-cowboy machines` lists every machine and its repos; `space-cowboy doctor [machine…]`
+checks that agents can run there.
 
 ## Status
 
 ```bash
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy status              # every machine
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy status devbox  # one machine
-~/.claude/skills/claude-space-cowboy/scripts/space-cowboy status --json       # {machine: [agents] | {error}}
+space-cowboy env list [--json]           # environments made here, with their Ona phase
+space-cowboy status [machine…] [--json]  # agents on every machine, as machine:id
 ```
 
-A machine that can't be reached shows as an error row. Its agents keep running.
+## Config (optional)
+
+`~/.claude/claude-space-cowboy/config.json`:
+
+```json
+{
+  "ona": { "region": "Ohio", "inactivity_timeout": "4h", "projects": { "ac": "Analytics Cluster" } },
+  "machines": { "dbt-primary": { "repos": ["/workspaces/dbt"] } }
+}
+```
+
+`ona.projects` adds short names for projects; `ona.git_email` / `ona.git_name` override
+the git identity copied from this machine's global git config. Environments made here are
+recorded in `envs.json` next to it.
+
+## How an environment is prepared
+
+`scripts/ona-bootstrap.sh` runs there and is safe to repeat. It installs Claude Code if
+missing and marks the repos trusted. It skips the first-run and bypass-mode prompts. It
+clones claude-cowboy, adds the gh-stack extension and sets the git identity. It writes
+**no credentials**:
+
+- Claude Code signs in from `CLAUDE_CODE_OAUTH_TOKEN`, which Ona mounts from the user's
+  secrets. `claude auth status` says "not logged in" even then; agents still work.
+- `gh` is a small wrapper in `~/.local/bin` that borrows git's Ona-provided GitHub
+  credential on each call. A real `gh auth login` in the environment takes precedence.
+- Worktrees start as plain checkouts (no copy-on-write there), without ignored files such
+  as `node_modules` or virtualenvs.
 
 ## Rules for you, the coordinator
 
-- Everything in claude-cowboy's "Rules for you, the orchestrator" applies here too.
+- Everything in claude-cowboy's "Rules for you, the orchestrator" applies.
+- Confirm before each new environment (that yes also covers its setup and stopping it once
+  its PRs are open), before every push or PR, before every deletion, and before any other
+  stop or start.
 - Send each command to the agent's own machine. Ids are only unique per machine.
-- Configuration (`on <machine> config --set …`), templates and concurrency limits are per
-  machine. Change another machine's config only when the user asks.
-- Agents run with permission checks bypassed by default. Mention this the first time you
-  spawn on each machine, especially remote ones that may have broader access than this one.
-- Reports and diffs from remote machines come back into this session. If an agent's
-  task touches customer or other sensitive data, tell it to keep that data out of its
-  report.
+- Reports and diffs come back into this session. If a task touches customer or other
+  sensitive data, tell the agent to keep that data out of its report.
